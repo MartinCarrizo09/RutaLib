@@ -158,28 +158,36 @@ rutalib/
 │       └── app.json
 ├── backend/                 # Python · FastAPI
 │   ├── .env                 # ← git-ignored, con secretos reales
+│   ├── .venv/               # git-ignored, con deps instaladas
 │   ├── Dockerfile           # stub
-│   ├── pyproject.toml       # stub
-│   ├── alembic/             # dir vacío, esperando `alembic init`
+│   ├── pyproject.toml       ✅ completo (incluye pins: pydantic[email], bcrypt<5)
+│   ├── alembic.ini          ✅
+│   ├── alembic/
+│   │   ├── env.py           ✅ async + fix SSL condicional
+│   │   └── versions/
+│   │       └── 0001_initial_schema.py  ✅ aplicada
 │   └── app/
 │       ├── __init__.py      ✅
-│       ├── main.py          ✅
+│       ├── main.py          ✅ /health + router auth montado
 │       ├── core/
 │       │   ├── __init__.py  ✅
-│       │   └── config.py    ✅ settings Pydantic
+│       │   ├── config.py    ✅ settings Pydantic
+│       │   └── security.py  ✅ bcrypt hash + JWT encode/decode
 │       ├── api/
-│       │   └── __init__.py  ✅ (vacío, falta routers)
+│       │   ├── __init__.py  ✅
+│       │   ├── deps.py      ✅ DbSession, CurrentUser, get_current_user
+│       │   └── auth.py      ✅ /register, /login, /me
 │       ├── services/
 │       │   └── __init__.py  ✅ (vacío, falta ai_pipeline/geocoding/heatmap)
 │       └── models/
-│           ├── __init__.py  ✅
-│           ├── base.py      ✅
+│           ├── __init__.py  ✅ re-exporta Base + todos los modelos
+│           ├── base.py      ✅ engine async + SSL condicional + get_db
 │           ├── user.py      ✅
 │           ├── report.py    ✅
 │           ├── place.py     ✅
 │           └── route.py     ✅
 ├── infra/
-│   └── docker-compose.yml   # stub
+│   └── docker-compose.yml   ✅ db:5433 + redis + backend
 └── docs/
     ├── CONTEXT.md           # ← este archivo
     ├── architecture.md
@@ -220,12 +228,20 @@ rutalib/
 - [x] **Docker Compose funcionando** — `db` (postgis/postgis:16-3.4) y `redis` (redis:7-alpine) arrancan healthy
 - [x] **`backend/.venv`** creado con `python -m venv` + `pip install -e .` — todas las deps instaladas
 - [x] **Migración 0001 aplicada** ✅ — verificado con `\dt`: tablas `user`, `place`, `place_review`, `report`, `report_photo`, `route` + `alembic_version`, todos los índices correctos, CHECK constraint vigente
+- [x] **Auth endpoints funcionando end-to-end** ✅ — `POST /api/v1/auth/register` (201 + JWT), `POST /api/v1/auth/login` (200 + JWT), `GET /api/v1/auth/me` (200 + perfil). Errores correctos: 409 duplicado, 401 bad pwd, 401 sin token
+- [x] Hashing passwords con `passlib[bcrypt]` + bcrypt 4.x (pin, ver gotcha #10)
+- [x] JWT con `python-jose`, HS256, `sub = user_id`, expiración según `ACCESS_TOKEN_EXPIRE_MINUTES`
+- [x] Primer usuario real en DB: `martin@rutalib.dev` (UUID `6f3feafc-f50e-4e19-a5c1-2d1f870495bc`)
 
 ### En curso / siguiente
-- [ ] Seed mínimo en DB para desarrollo (un user + un par de reports)
-- [ ] `backend/app/api/` — routers (reports, places, map, auth, me)
-- [ ] `backend/app/services/` — ai_pipeline, geocoding, heatmap
-- [ ] Primer endpoint real andando: `GET /health` ya existe; siguiente `POST /auth/register` + `POST /auth/login`
+- [ ] `backend/app/api/reports.py` — `POST /reports` (multipart: foto + geo + descripción), `GET /reports?bbox=...`, `POST /reports/:id/confirm`
+- [ ] `backend/app/api/places.py` — `GET /places?near=...`, `POST /places/:id/review`
+- [ ] `backend/app/api/map.py` — `GET /map/heatmap?bbox=...`, `POST /map/route`
+- [ ] `backend/app/services/geocoding.py` — wrapper de Google Geocoding API usando `GOOGLE_MAPS_API_KEY`
+- [ ] `backend/app/services/ai_pipeline.py` — Gemini 2.5 Flash para clasificar fotos de barreras
+- [ ] `backend/app/services/heatmap.py` — agregación GIST + cache Redis
+- [ ] Worker RQ arrancado con `docker compose up worker` (todavía no existe el servicio)
+- [ ] Seed mínimo opcional: un par de reports dummy para probar el mapa
 
 ---
 
@@ -312,6 +328,23 @@ Funciona con quoting. Si en un query crudo te olvidás las comillas, falla. SQLA
 ### 8. PostGIS `tiger` schema en el search_path
 La imagen `postgis/postgis:16-3.4` instala las extensiones **postgis_tiger_geocoder** y **topology**, y agrega ambos al `search_path` (`"$user", public, topology, tiger`). La `tiger` schema tiene una tabla llamada **`place`** (geocoder USA). No nos afecta porque nuestras tablas están en `public`, pero tener presente si alguna query hace `SELECT * FROM place` sin schema prefix → puede resolver a `tiger.place`.
 
+### 9. `pydantic.EmailStr` requiere `email-validator`
+`from pydantic import EmailStr` funciona, pero cuando FastAPI registra una ruta con un modelo que usa `EmailStr`, Pydantic genera el schema y **ahí** falla con `ImportError: email-validator is not installed`. Síntoma: uvicorn crashea al arrancar (no es error de request).
+
+Fix: dependency `pydantic[email]>=2.7.0` en pyproject (en lugar de `pydantic>=2.7.0`). El extra `[email]` trae `email-validator` + `dnspython`.
+
+### 10. `passlib 1.7.4` es incompatible con `bcrypt 5.x`
+`bcrypt 5.0` removió la truncación silenciosa de passwords >72 bytes. `passlib 1.7.4` tiene un auto-test interno (`detect_wrap_bug`) que genera un hash con un password largo al arrancar el primer hash → `ValueError: password cannot be longer than 72 bytes`. Los passwords reales pueden ser cortos, pero el test interno siempre corre.
+
+Síntoma: `POST /auth/register` devuelve 500, traceback apunta a `_finalize_backend_mixin`.
+
+Fix aplicado: pin `bcrypt<5` en pyproject.toml. Cuando passlib saque una versión nueva con soporte oficial para bcrypt 5.x (issue abierto en su repo), se puede soltar el pin.
+
+### 11. uvicorn `--reload` + Windows → procesos huérfanos en port 8000
+Con `--reload`, uvicorn spawna subprocess. Si el parent muere sin limpiar, el child queda como **orphan** heredando el socket. `taskkill` al parent no mata al child → puerto 8000 sigue ocupado. Hay que `taskkill` también los `python.exe` hijos (se ven con `wmic process ... parentprocessid=<uvicorn_pid>`).
+
+**Workaround:** en local preferir `uvicorn app.main:app --host 127.0.0.1 --port 8000` (sin `--reload`) y reiniciar manual tras cambios, o usar `uvicorn --reload-dir app` que limita el watcher.
+
 ---
 
 ## Troubleshooting rápido
@@ -324,6 +357,9 @@ La imagen `postgis/postgis:16-3.4` instala las extensiones **postgis_tiger_geoco
 | `ImportError: cannot import name 'Base'` | `app/models/__init__.py` vacío | Re-exportar Base + modelos |
 | `multiple top-level packages discovered` | Falta config setuptools | `[tool.setuptools.packages.find]` con `include=["app*"]` |
 | `pg_isready` ok pero asyncpg falla | DB inicializando PostGIS tras wipe | Esperar 5s extra, los init scripts de `postgis_tiger` tardan |
+| `ImportError: email-validator is not installed` | `pydantic` sin extra `[email]` | `pydantic[email]>=2.7.0` en deps |
+| `password cannot be longer than 72 bytes` en registro/login | bcrypt 5.x rompe passlib 1.7.4 | Pin `bcrypt<5` |
+| `error 10048: solo se permite un uso de cada dirección de socket` | uvicorn `--reload` huérfano | Matar subprocess python children de uvicorn + reintentar |
 - [ ] Scaffold React Native (Expo)
 - [ ] Firebase Cloud Messaging (cuando arranque mobile)
 - [ ] Rotar `SECRET_KEY` antes de cualquier release público
