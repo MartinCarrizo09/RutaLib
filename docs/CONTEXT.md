@@ -115,9 +115,11 @@ Tres capas:
 **Tipos geo:** `GEOGRAPHY(POINT, 4326)` para puntos, `GEOGRAPHY(LINESTRING, 4326)` para rutas.
 
 ### Decisiones cerradas del modelo
-- **Versionado de reportes:** reporte nuevo de tipo `resolved`/`improved`, nunca editar el original
-- **Soft delete:** sí — campo `deleted_at timestamptz` nullable en `report` y `user`
-- **Particionado:** no desde el día uno, esperar a 1M reportes
+Confirmadas antes de la primera migración Alembic — congeladas salvo razón fuerte. Detalle completo en [data-model.md](./data-model.md#decisiones-cerradas).
+
+- **Versionado de reportes:** reporte nuevo con `report_kind ∈ {resolved, improved}` y FK `resolves_report_id` apuntando al `barrier` original. Nunca se edita el original. Historial inmutable para métricas y PDF municipal.
+- **Soft delete:** columna `deleted_at timestamptz NULL` en `report` y `user`. Índices parciales con `WHERE deleted_at IS NULL`. Filtro aplicado en el repo layer del backend, no en cada query.
+- **Particionado:** tabla `report` monolítica hasta 1M filas. A 800k (80%) → ticket de deuda técnica para migrar a partición mensual por `created_at`.
 
 ---
 
@@ -155,15 +157,29 @@ rutalib/
 │       │   └── services/    # API client, SQLite offline
 │       └── app.json
 ├── backend/                 # Python · FastAPI
-│   ├── .env                 # ← ya existe, git-ignored, tiene secretos reales
-│   ├── Dockerfile           # ← ya existe (stub)
-│   ├── pyproject.toml       # ← ya existe (stub)
-│   └── app/                 # ← todavía no existe
-│       ├── api/             # Routers: reports, places, map, auth
-│       ├── services/        # ai_pipeline, geocoding, heatmap
-│       └── models/          # SQLAlchemy + PostGIS
+│   ├── .env                 # ← git-ignored, con secretos reales
+│   ├── Dockerfile           # stub
+│   ├── pyproject.toml       # stub
+│   ├── alembic/             # dir vacío, esperando `alembic init`
+│   └── app/
+│       ├── __init__.py      ✅
+│       ├── main.py          ✅
+│       ├── core/
+│       │   ├── __init__.py  ✅
+│       │   └── config.py    ✅ settings Pydantic
+│       ├── api/
+│       │   └── __init__.py  ✅ (vacío, falta routers)
+│       ├── services/
+│       │   └── __init__.py  ✅ (vacío, falta ai_pipeline/geocoding/heatmap)
+│       └── models/
+│           ├── __init__.py  ✅
+│           ├── base.py      ✅
+│           ├── user.py      ✅
+│           ├── report.py    ✅
+│           ├── place.py     ✅
+│           └── route.py     ✅
 ├── infra/
-│   └── docker-compose.yml   # ← ya existe (stub)
+│   └── docker-compose.yml   # stub
 └── docs/
     ├── CONTEXT.md           # ← este archivo
     ├── architecture.md
@@ -191,12 +207,16 @@ rutalib/
 - [x] ADC local configurado (Python puede llamar a Vertex sin service account)
 - [x] **Vertex AI / Gemini probado end-to-end** — modelo `gemini-2.5-flash`
 - [x] `backend/.env` con todos los valores reales (excepto Firebase)
+- [x] Estructura de carpetas del backend creada (`app/`, `core/`, `api/`, `services/`, `models/` con `__init__.py`)
+- [x] Stubs escritos: `main.py`, `core/config.py`, `models/{base,user,report,place,route}.py`
+- [x] Decisiones del modelo cerradas definitivamente (ver [data-model.md § Decisiones cerradas](./data-model.md#decisiones-cerradas))
 
 ### En curso / siguiente
-- [ ] `infra/docker-compose.yml` — Postgres+PostGIS + Redis
-- [ ] `backend/pyproject.toml` — dependencias Python
-- [ ] Estructura de carpetas del backend (`app/api`, `app/services`, `app/models`)
-- [ ] Primera migración Alembic (tablas base del data-model)
+- [ ] `infra/docker-compose.yml` — Postgres+PostGIS + Redis (hoy es stub)
+- [ ] `backend/pyproject.toml` completo — FastAPI, SQLAlchemy 2.x, asyncpg, alembic, google-cloud-aiplatform, google-cloud-storage, redis, python-jose
+- [ ] `backend/app/api/` — routers vacíos todavía (reports, places, map, auth, me)
+- [ ] `backend/app/services/` — vacío (ai_pipeline, geocoding, heatmap)
+- [ ] `alembic init` + primera migración con las tablas del data-model (incluir `deleted_at`, `report_kind`, `resolves_report_id` y el CHECK constraint)
 - [ ] Scaffold React Native (Expo)
 - [ ] Firebase Cloud Messaging (cuando arranque mobile)
 - [ ] Rotar `SECRET_KEY` antes de cualquier release público

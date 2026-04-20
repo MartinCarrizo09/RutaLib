@@ -26,6 +26,7 @@ erDiagram
         text display_name
         jsonb accessibility_profile
         timestamptz created_at
+        timestamptz deleted_at "nullable · soft delete"
     }
     PLACE {
         uuid id PK
@@ -39,7 +40,9 @@ erDiagram
         uuid id PK
         uuid user_id FK
         uuid place_id FK "nullable"
+        uuid resolves_report_id FK "nullable"
         geography location "POINT 4326"
+        text report_kind "barrier|resolved|improved"
         text barrier_type
         text severity
         text status
@@ -47,6 +50,7 @@ erDiagram
         float ai_confidence
         text description
         timestamptz created_at
+        timestamptz deleted_at "nullable · soft delete"
     }
     REPORT_PHOTO {
         uuid id PK
@@ -83,6 +87,7 @@ Perfil mínimo. `accessibility_profile` guarda preferencias del usuario (silla d
 | display_name | text | opcional, público |
 | accessibility_profile | jsonb | `{mobility: "wheelchair", vision: "low", ...}` |
 | created_at | timestamptz | default `now()` |
+| deleted_at | timestamptz | nullable · soft delete (ver Decisiones cerradas) |
 
 ### `place`
 Lugar físico (comercio, estación, plaza). Puede venir de Google Places o ser creado por reportes agrupados.
@@ -98,14 +103,16 @@ Lugar físico (comercio, estación, plaza). Puede venir de Google Places o ser c
 | google_place_id | text | nullable, para sync |
 
 ### `report`
-Núcleo del sistema. Un reporte de barrera o mejora puntual.
+Núcleo del sistema. Un reporte de barrera, resolución o mejora puntual.
 
 | columna | tipo | notas |
 |---|---|---|
 | id | uuid | PK |
 | user_id | uuid | FK → user |
 | place_id | uuid | FK → place, nullable (puede ser en vía pública) |
+| resolves_report_id | uuid | FK → report, nullable. Apunta al reporte `barrier` original cuando `report_kind ∈ {resolved, improved}` |
 | location | geography(POINT, 4326) | **GIST index** |
+| report_kind | text | enum: `barrier` \| `resolved` \| `improved`. Default `barrier`. Nunca se edita el reporte original — se crea uno nuevo (ver Decisiones cerradas) |
 | barrier_type | text | `stairs`, `broken_ramp`, `obstacle`, `no_signage`, ... |
 | severity | text | `low`, `medium`, `high`, `blocking` |
 | status | text | `pending`, `queued`, `approved`, `review`, `rejected` |
@@ -114,11 +121,26 @@ Núcleo del sistema. Un reporte de barrera o mejora puntual.
 | description | text | input del usuario |
 | created_at | timestamptz | |
 | expires_at | timestamptz | nullable, para barreras temporales (obra) |
+| deleted_at | timestamptz | nullable · soft delete (ver Decisiones cerradas) |
+
+**Reglas de negocio:**
+- Cuando entra un `resolved` con `confidence >= 0.7` y apunta a un `barrier` activo → marcar el `barrier` como `status = 'resolved'` pero mantenerlo en tabla (no borrar). Así queda el historial.
+- `resolves_report_id` debe ser `NULL` si `report_kind = 'barrier'`.
+- `resolves_report_id` debe ser `NOT NULL` si `report_kind IN ('resolved', 'improved')`. Se valida por `CHECK` constraint.
 
 **Índices clave:**
-- `CREATE INDEX idx_report_location ON report USING GIST(location);`
-- `CREATE INDEX idx_report_status_created ON report(status, created_at DESC);`
-- `CREATE INDEX idx_report_place ON report(place_id) WHERE place_id IS NOT NULL;`
+- `CREATE INDEX idx_report_location ON report USING GIST(location) WHERE deleted_at IS NULL;`
+- `CREATE INDEX idx_report_status_created ON report(status, created_at DESC) WHERE deleted_at IS NULL;`
+- `CREATE INDEX idx_report_place ON report(place_id) WHERE place_id IS NOT NULL AND deleted_at IS NULL;`
+- `CREATE INDEX idx_report_resolves ON report(resolves_report_id) WHERE resolves_report_id IS NOT NULL;`
+
+**Constraints:**
+```sql
+ALTER TABLE report ADD CONSTRAINT chk_resolves_matches_kind CHECK (
+  (report_kind = 'barrier'       AND resolves_report_id IS NULL) OR
+  (report_kind IN ('resolved', 'improved') AND resolves_report_id IS NOT NULL)
+);
+```
 
 ### `report_photo`
 Fotos asociadas a un reporte. Separada para permitir 1..N fotos y facilitar purga.
@@ -138,20 +160,31 @@ Reseñas cualitativas. `accessibility_tags` permite búsqueda facetada (`{ramp: 
 
 ## Consultas geoespaciales típicas
 
+> Todas las queries que consultan datos "vivos" filtran `deleted_at IS NULL`. Un soft-deleted no debe aparecer en mapas, heatmaps ni búsquedas.
+
 ```sql
--- Reportes activos en un radio de 500m
+-- Reportes de barreras activas en un radio de 500m
 SELECT * FROM report
 WHERE status = 'approved'
+  AND report_kind = 'barrier'
+  AND deleted_at IS NULL
   AND ST_DWithin(location, ST_MakePoint(:lng, :lat)::geography, 500)
   AND (expires_at IS NULL OR expires_at > now());
 
--- Heatmap: clusters de reportes por zona (grid de ~100m)
+-- Heatmap: clusters de barreras activas por zona (grid de ~100m)
 SELECT
   ST_SnapToGrid(location::geometry, 0.001) AS cell,
   COUNT(*) AS n
 FROM report
 WHERE status = 'approved'
+  AND report_kind = 'barrier'
+  AND deleted_at IS NULL
 GROUP BY cell;
+
+-- Historial de un reporte: barrier + sus resolves/improvements
+SELECT * FROM report
+WHERE id = :barrier_id OR resolves_report_id = :barrier_id
+ORDER BY created_at ASC;
 
 -- Lugares accesibles cercanos ordenados por score
 SELECT id, name, accessibility_score,
@@ -162,8 +195,41 @@ WHERE ST_DWithin(location, :user_loc, 1000)
 ORDER BY meters ASC;
 ```
 
-## Decisiones pendientes
+---
 
-- [ ] ¿Versionado de reportes? Si un lugar arregla la rampa, ¿editamos el reporte o creamos uno nuevo de tipo "mejora"?
-- [ ] ¿Soft delete vs hard delete en `report`? Probablemente soft, por auditoría.
-- [ ] ¿Particionado por fecha en `report` desde el día uno, o esperar a volumen?
+## Decisiones cerradas
+
+Las siguientes tres decisiones se cerraron antes de generar la primera migración Alembic. Cualquier cambio posterior implica migraciones destructivas, así que están congeladas salvo razón fuerte.
+
+### ✅ 1. Versionado de reportes — reporte nuevo, nunca editar
+Si un lugar arregla una rampa reportada, **no editamos** el reporte original. Se crea un reporte nuevo con `report_kind = 'resolved'` (o `'improved'` si es una mejora, no una reparación) y `resolves_report_id` apuntando al `barrier` original.
+
+**Por qué:**
+- Queda historial inmutable → útil para generar métricas ("cuántas barreras se resolvieron en 2026") y para el PDF municipal automático.
+- Evita race conditions: si dos usuarios reportan el mismo cambio, tenemos dos reportes nuevos que podemos deduplicar vs. dos UPDATEs compitiendo sobre la misma fila.
+- La UI puede seguir mostrando el `barrier` original con un overlay "marcada como resuelta por otros usuarios" hasta que la resolución se confirme.
+
+**Implementación:** columna `report_kind` + FK `resolves_report_id` + CHECK constraint. Detalles en la tabla `report`.
+
+### ✅ 2. Soft delete con `deleted_at`
+Todas las tablas con datos de usuario (`report`, `user`) usan **soft delete** — columna `deleted_at timestamptz NULL`. No se hace `DELETE` físico desde la app salvo requerimiento legal (GDPR art. 17, por ejemplo).
+
+**Por qué:**
+- Auditoría: necesitamos saber qué usuario reportó qué y cuándo, incluso si después se dio de baja.
+- Recuperación de errores: si alguien marca mal "resuelto", restituir es un `UPDATE` y no un restore de backup.
+- Crowdsourcing: poder diferenciar reportes eliminados por moderación vs. reportes que nunca existieron.
+
+**Implementación:**
+- Columna `deleted_at timestamptz NULL DEFAULT NULL` en `report` y `user`.
+- Todos los índices relevantes son **parciales** con `WHERE deleted_at IS NULL` para no inflar el índice con filas borradas.
+- Queries de lectura filtran siempre `deleted_at IS NULL`. Implementado en el repo layer del backend (no confiar en que cada query lo recuerde).
+
+### ✅ 3. Sin particionado hasta 1M reportes
+La tabla `report` **no** se particiona desde el día uno. Cuando el conteo se acerque a **1.000.000 de filas**, se particiona por `RANGE(created_at)` con particiones mensuales.
+
+**Por qué:**
+- Particionar desde cero agrega complejidad operativa (attach/detach de particiones, FKs cross-partition, backup) sin beneficio real a bajo volumen.
+- PostgreSQL 16 + índices GIST bien pensados escala cómodamente a millones de filas en una sola tabla.
+- Migrar de tabla monolítica a particionada es un proceso documentado y controlable — no un one-way-door.
+
+**Trigger de migración:** cuando `SELECT count(*) FROM report` supere 800k (80% del umbral), crear ticket de deuda técnica para planificar la migración con ventana.
