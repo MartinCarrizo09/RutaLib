@@ -208,15 +208,122 @@ rutalib/
 - [x] **Vertex AI / Gemini probado end-to-end** — modelo `gemini-2.5-flash`
 - [x] `backend/.env` con todos los valores reales (excepto Firebase)
 - [x] Estructura de carpetas del backend creada (`app/`, `core/`, `api/`, `services/`, `models/` con `__init__.py`)
-- [x] Stubs escritos: `main.py`, `core/config.py`, `models/{base,user,report,place,route}.py`
+- [x] `backend/pyproject.toml` completo (FastAPI, SQLAlchemy async, asyncpg, geoalchemy2, alembic, redis/rq, google-cloud-*, passlib/jose, pydantic-settings)
+- [x] Modelos SQLAlchemy 2.x escritos: `base.py` (engine + `AsyncSessionLocal` + `get_db`), `user.py`, `report.py` (con `Report` + `ReportPhoto` + CHECK constraint), `place.py` (con `Place` + `PlaceReview`), `route.py`
+- [x] `backend/app/models/__init__.py` re-exporta `Base` y todos los modelos — necesario para que `Base.metadata` conozca las tablas cuando Alembic corre `env.py`
+- [x] `backend/app/main.py` — FastAPI app + `/health` + CORS. Routers comentados hasta que existan
+- [x] `backend/app/core/config.py` — `Settings` con Pydantic, lee de `.env`
+- [x] `infra/docker-compose.yml` — servicios `db` (postgis/postgis:16-3.4), `redis` (redis:7-alpine) y `backend` con healthchecks y `depends_on`
+- [x] `backend/alembic.ini` + `alembic/env.py` (async, inyecta URL desde `settings.database_url`)
+- [x] `backend/alembic/versions/0001_initial_schema.py` — migración hand-written con todas las tablas del data-model, extensión `postgis`, índices GIST + parciales con `WHERE deleted_at IS NULL`, y el CHECK constraint `chk_resolves_matches_kind`
 - [x] Decisiones del modelo cerradas definitivamente (ver [data-model.md § Decisiones cerradas](./data-model.md#decisiones-cerradas))
+- [x] **Docker Compose funcionando** — `db` (postgis/postgis:16-3.4) y `redis` (redis:7-alpine) arrancan healthy
+- [x] **`backend/.venv`** creado con `python -m venv` + `pip install -e .` — todas las deps instaladas
+- [x] **Migración 0001 aplicada** ✅ — verificado con `\dt`: tablas `user`, `place`, `place_review`, `report`, `report_photo`, `route` + `alembic_version`, todos los índices correctos, CHECK constraint vigente
 
 ### En curso / siguiente
-- [ ] `infra/docker-compose.yml` — Postgres+PostGIS + Redis (hoy es stub)
-- [ ] `backend/pyproject.toml` completo — FastAPI, SQLAlchemy 2.x, asyncpg, alembic, google-cloud-aiplatform, google-cloud-storage, redis, python-jose
-- [ ] `backend/app/api/` — routers vacíos todavía (reports, places, map, auth, me)
-- [ ] `backend/app/services/` — vacío (ai_pipeline, geocoding, heatmap)
-- [ ] `alembic init` + primera migración con las tablas del data-model (incluir `deleted_at`, `report_kind`, `resolves_report_id` y el CHECK constraint)
+- [ ] Seed mínimo en DB para desarrollo (un user + un par de reports)
+- [ ] `backend/app/api/` — routers (reports, places, map, auth, me)
+- [ ] `backend/app/services/` — ai_pipeline, geocoding, heatmap
+- [ ] Primer endpoint real andando: `GET /health` ya existe; siguiente `POST /auth/register` + `POST /auth/login`
+
+---
+
+## Setup local — comandos concretos para retomar
+
+Asumiendo el repo clonado, desde la raíz:
+
+```bash
+# 1. Levantar DB (Postgres 16 + PostGIS + Redis)
+cd infra && docker compose up db redis -d
+
+# 2. Venv + deps (una sola vez)
+cd ../backend
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -e .   # Windows
+# o source .venv/bin/activate && pip install -e .   # Linux/Mac
+
+# 3. Aplicar migración
+.venv/Scripts/alembic.exe upgrade head
+
+# 4. Arrancar el backend
+.venv/Scripts/uvicorn.exe app.main:app --reload
+# → http://localhost:8000/health
+# → http://localhost:8000/docs (Swagger)
+```
+
+---
+
+## ⚠️ Gotchas del setup local (Windows) — evitar re-descubrirlas
+
+Estas cosas rompieron el setup y costaron debug. Documentadas para que la próxima sesión no pierda tiempo.
+
+### 1. Puerto Docker: **5433**, no 5432
+Martín tiene **PostgreSQL 17 nativo instalado como servicio Windows** (`postgresql-x64-17`) que se autoarranca y escucha en 5432. No se tocó (puede estar en uso por otros proyectos).
+
+- `docker-compose.yml` mapea `"5433:5432"` (host:container).
+- `backend/.env` tiene `DATABASE_URL=...@localhost:5433/rutalib`.
+- `backend/alembic.ini` tiene la misma URL por consistencia visual (env.py igual la sobreescribe).
+- Dentro de Docker, el servicio `backend` usa `db:5432` (red interna de Docker, no mapeo de host).
+
+### 2. `connect_args={"ssl": False}` obligatorio en local
+El proxy de Docker Desktop en Windows **corta el handshake SSL** que asyncpg intenta por default. Síntomas: `ConnectionDoesNotExistError: connection was closed in the middle of operation`.
+
+Fix aplicado en dos lugares:
+- `backend/alembic/env.py` → `async_engine_from_config(..., connect_args={"ssl": False})`
+- `backend/app/models/base.py` → `create_async_engine(..., connect_args={"ssl": False} if _is_local else {})`
+
+Para **producción con DB cloud (Supabase/Neon/Cloud SQL)** el flag condicional `_is_local` (detecta `localhost`/`127.0.0.1`) evita mandar `ssl=False`, así se usa SSL normal.
+
+### 3. `spatial_index=False` en columnas `Geography`
+Por default **GeoAlchemy2 genera automáticamente** un índice GIST en cada columna `Geography`. Combinado con los `op.create_index(...)` explícitos de la migración → **CREATE INDEX duplicado** → falla con `relation "idx_X_location" already exists`.
+
+Fix: todas las columnas `Geography` tienen `spatial_index=False`, tanto en la migración como en los modelos SQLAlchemy (`place.py`, `report.py`, `route.py`). Los índices se crean SOLO vía los `op.create_index()` manuales, que además son parciales (`WHERE deleted_at IS NULL`).
+
+### 4. `app/models/__init__.py` re-exporta Base
+Vacío genera `ImportError` al correr `alembic upgrade head` (env.py hace `from app.models import Base`). Debe tener:
+```python
+from app.models.base import Base, engine, AsyncSessionLocal, get_db
+from app.models.user import User
+from app.models.place import Place, PlaceReview
+from app.models.report import Report, ReportPhoto
+from app.models.route import Route
+```
+Así `Base.metadata` conoce todas las tablas cuando Alembic corre.
+
+### 5. `pyproject.toml` — discovery explícito de packages
+`pip install -e .` falla con "multiple packages found" porque setuptools ve `app/` y `alembic/`. Agregado al final del pyproject:
+```toml
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["alembic*", "tests*"]
+```
+
+### 6. `CREATE EXTENSION "uuid-ossp"` en la migración es dead weight
+La migración lo crea pero nadie lo usa (todas las PKs usan `gen_random_uuid()` que es nativo en PG 13+). Se puede remover en una próxima migración, no bloquea nada.
+
+### 7. Tabla `user` — palabra reservada PG
+Funciona con quoting. Si en un query crudo te olvidás las comillas, falla. SQLAlchemy las agrega automáticamente via el modelo `User`, no es problema en ORM queries.
+
+### 8. PostGIS `tiger` schema en el search_path
+La imagen `postgis/postgis:16-3.4` instala las extensiones **postgis_tiger_geocoder** y **topology**, y agrega ambos al `search_path` (`"$user", public, topology, tiger`). La `tiger` schema tiene una tabla llamada **`place`** (geocoder USA). No nos afecta porque nuestras tablas están en `public`, pero tener presente si alguna query hace `SELECT * FROM place` sin schema prefix → puede resolver a `tiger.place`.
+
+---
+
+## Troubleshooting rápido
+
+| Síntoma | Causa probable | Fix |
+|---|---|---|
+| `connection was closed in the middle of operation` | SSL handshake roto en Windows | `connect_args={"ssl": False}` |
+| `password authentication failed` | Puerto 5432 ocupado por PG nativo | Usar puerto **5433** |
+| `relation "idx_X_location" already exists` | GeoAlchemy2 auto-index | `spatial_index=False` en columna Geography |
+| `ImportError: cannot import name 'Base'` | `app/models/__init__.py` vacío | Re-exportar Base + modelos |
+| `multiple top-level packages discovered` | Falta config setuptools | `[tool.setuptools.packages.find]` con `include=["app*"]` |
+| `pg_isready` ok pero asyncpg falla | DB inicializando PostGIS tras wipe | Esperar 5s extra, los init scripts de `postgis_tiger` tardan |
 - [ ] Scaffold React Native (Expo)
 - [ ] Firebase Cloud Messaging (cuando arranque mobile)
 - [ ] Rotar `SECRET_KEY` antes de cualquier release público
